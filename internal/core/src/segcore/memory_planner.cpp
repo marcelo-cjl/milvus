@@ -14,6 +14,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #include <cxxabi.h>
+#include <chrono>
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
@@ -188,9 +189,11 @@ LoadWithStrategy(const std::vector<std::string>& remote_files,
             auto reader_memory_limit = std::max<int64_t>(
                 memory_limit / blocks.size(), FILE_SLICE_SIZE.load());
 
-            for (const auto& block : blocks) {
+            for (size_t blk_i = 0; blk_i < blocks.size(); ++blk_i) {
+                const auto& block = blocks[blk_i];
                 futures.emplace_back(pool.Submit(
-                    [block, fs, file, file_idx, schema, reader_memory_limit]() {
+                    [block, blk_i, fs, file, file_idx, schema, reader_memory_limit]() {
+                        auto t_blk_start = std::chrono::steady_clock::now();
                         AssertInfo(fs != nullptr,
                                    "[StorageV2] file system is nullptr");
                         auto result = milvus_storage::FileRowGroupReader::Make(
@@ -208,6 +211,9 @@ LoadWithStrategy(const std::vector<std::string>& remote_files,
                             folly::makeGuard([&row_group_reader]() {
                                 (void)row_group_reader->Close();
                             });
+
+                        auto t_open_done = std::chrono::steady_clock::now();
+
                         auto status =
                             row_group_reader->SetRowGroupOffsetAndCount(
                                 block.offset, block.count);
@@ -218,6 +224,7 @@ LoadWithStrategy(const std::vector<std::string>& remote_files,
                                        std::to_string(block.count) +
                                        " with error " + status.ToString());
                         auto ret = std::make_shared<ArrowDataWrapper>();
+                        int64_t block_rows = 0;
                         for (int64_t i = 0; i < block.count; ++i) {
                             std::shared_ptr<arrow::Table> table;
                             auto status =
@@ -227,11 +234,23 @@ LoadWithStrategy(const std::vector<std::string>& remote_files,
                                            std::to_string(block.offset + i) +
                                            " from file " + file +
                                            " with error " + status.ToString());
+                            block_rows += table->num_rows();
                             ret->arrow_tables.push_back(
                                 {file_idx,
                                  static_cast<size_t>(block.offset + i),
                                  table});
                         }
+
+                        auto t_blk_done = std::chrono::steady_clock::now();
+                        auto open_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            t_open_done - t_blk_start).count();
+                        auto read_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            t_blk_done - t_open_done).count();
+                        LOG_INFO("[LoadWithStrategy] block[{}] rg=[{},+{}), "
+                                 "rows={}, open={} ms, read={} ms",
+                                 blk_i, block.offset, block.count,
+                                 block_rows, open_ms, read_ms);
+
                         return ret;
                     }));
             }

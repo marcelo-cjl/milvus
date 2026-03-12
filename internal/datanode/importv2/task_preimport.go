@@ -185,6 +185,34 @@ func (t *PreImportTask) Execute() []*conc.Future[any] {
 	return futures
 }
 
+// NumRowsReader is an optional interface that readers can implement to provide
+// the total row count from file metadata (e.g., parquet footer) without reading all data.
+type NumRowsReader interface {
+	NumRows() int64
+}
+
+// canUseMetadataFastPath checks if we can skip reading all data and use file metadata instead.
+// This is safe when: no partition key field, single partition, and either autoID or single channel.
+func (t *PreImportTask) canUseMetadataFastPath() bool {
+	schema := t.GetSchema()
+	_, err := typeutil.GetPartitionKeyFieldSchema(schema)
+	hasPartitionKey := err == nil
+	if hasPartitionKey {
+		return false
+	}
+	if len(t.partitionIDs) != 1 {
+		return false
+	}
+	pkField, err := typeutil.GetPrimaryFieldSchema(schema)
+	if err != nil {
+		return false
+	}
+	// With single partition + no partition key:
+	// - autoID: rows evenly distributed across channels (existing approximation)
+	// - single channel: all rows go to channel 0
+	return pkField.GetAutoID() || len(t.vchannels) == 1
+}
+
 func (t *PreImportTask) readFileStat(reader importutilv2.Reader, fileIdx int) error {
 	fileSize, err := reader.Size()
 	if err != nil {
@@ -197,6 +225,41 @@ func (t *PreImportTask) readFileStat(reader importutilv2.Reader, fileIdx int) er
 				"fileSize=%d, maxSize=%d", fileSize, int64(maxSize)))
 	}
 
+	// Fast path: use file metadata instead of reading all data
+	if nrReader, ok := reader.(NumRowsReader); ok && t.canUseMetadataFastPath() {
+		numRows := nrReader.NumRows()
+		sizePerRecord, err := typeutil.EstimateSizePerRecord(t.GetSchema())
+		if err != nil {
+			return err
+		}
+		totalMemorySize := int64(sizePerRecord) * numRows
+
+		channelNum := len(t.vchannels)
+		partitionID := t.partitionIDs[0]
+		hashedStats := make(map[string]*datapb.PartitionImportStats)
+		for _, channel := range t.vchannels {
+			rowsForChannel := numRows / int64(channelNum)
+			sizeForChannel := totalMemorySize / int64(channelNum)
+			hashedStats[channel] = &datapb.PartitionImportStats{
+				PartitionRows:     map[int64]int64{partitionID: rowsForChannel},
+				PartitionDataSize: map[int64]int64{partitionID: sizeForChannel},
+			}
+		}
+
+		stat := &datapb.ImportFileStats{
+			FileSize:        fileSize,
+			TotalRows:       numRows,
+			TotalMemorySize: totalMemorySize,
+			HashedStats:     hashedStats,
+		}
+		t.manager.Update(t.GetTaskID(), UpdateFileStat(fileIdx, stat))
+		log.Info("preimport fast path: used file metadata",
+			WrapLogFields(t, zap.Int64("numRows", numRows),
+				zap.Int64("totalMemorySize", totalMemorySize))...)
+		return nil
+	}
+
+	// Slow path: read all data to compute stats
 	totalRows := 0
 	totalSize := 0
 	hashedStats := make(map[string]*datapb.PartitionImportStats)

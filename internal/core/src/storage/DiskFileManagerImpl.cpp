@@ -815,10 +815,12 @@ DiskFileManagerImpl::cache_raw_data_to_disk_storage_v2(const Config& config) {
     auto manifest =
         index::GetValueFromConfig<std::string>(config, SEGMENT_MANIFEST_KEY);
     auto manifest_path_str = manifest.value_or("");
+    auto t_s3_start = std::chrono::steady_clock::now();
     if (manifest_path_str != "") {
         AssertInfo(
             loon_ffi_properties_ != nullptr,
             "loon ffi properties is null when build index with manifest");
+        LOG_INFO("[CacheRawDataToDisk] storage_v2 path: using manifest (loon reader)");
         field_datas = GetFieldDatasFromManifest(manifest_path_str,
                                                 loon_ffi_properties_,
                                                 field_meta_,
@@ -826,12 +828,23 @@ DiskFileManagerImpl::cache_raw_data_to_disk_storage_v2(const Config& config) {
                                                 dim,
                                                 element_type);
     } else {
+        LOG_INFO("[CacheRawDataToDisk] storage_v2 path: using StorageV2 (no manifest)");
         field_datas = GetFieldDatasFromStorageV2(all_remote_files,
                                                  GetFieldDataMeta().field_id,
                                                  data_type.value(),
                                                  element_type.value(),
                                                  dim,
                                                  fs_);
+    }
+    auto t_s3_end = std::chrono::steady_clock::now();
+    {
+        int64_t total_bytes = 0;
+        for (auto& fd : field_datas) {
+            total_bytes += fd->Size();
+        }
+        auto s3_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_s3_end - t_s3_start).count();
+        LOG_INFO("[CacheRawDataToDisk] S3 read + deserialize: {} ms, {} field_datas, {} bytes total",
+                 s3_ms, field_datas.size(), total_bytes);
     }
 
     bool nullable = false;
@@ -851,6 +864,7 @@ DiskFileManagerImpl::cache_raw_data_to_disk_storage_v2(const Config& config) {
     }
 
     int64_t chunk_offset = 0;
+    auto t_disk_start = std::chrono::steady_clock::now();
     for (auto& field_data : field_datas) {
         num_rows += uint32_t(field_data->get_valid_rows());
         if (nullable) {
@@ -870,6 +884,12 @@ DiskFileManagerImpl::cache_raw_data_to_disk_storage_v2(const Config& config) {
                                          var_dim,
                                          write_offset,
                                          is_vector_array ? &offsets : nullptr);
+    }
+    auto t_disk_end = std::chrono::steady_clock::now();
+    {
+        auto disk_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_disk_end - t_disk_start).count();
+        LOG_INFO("[CacheRawDataToDisk] write to disk: {} ms, num_rows={}, dim={}",
+                 disk_ms, num_rows, var_dim);
     }
 
     // write num_rows and dim value to file header

@@ -15,6 +15,7 @@
 #include <arrow/c/bridge.h>
 #include <exception>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -164,6 +165,12 @@ GetFFIReaderStream(CFFIPackedReader c_packed_reader,
                    int64_t buffer_size,
                    struct ArrowArrayStream* out_stream) {
     SCOPE_CGO_CALL_METRIC();
+
+    // Initialize Loon thread pool for parallel S3 reads (once)
+    static std::once_flag loon_tp_flag;
+    std::call_once(loon_tp_flag, []() {
+        loon_thread_pool_singleton(8);
+    });
 
     try {
         auto reader =

@@ -14,7 +14,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <chrono>
 #include <memory>
+#include <mutex>
 
 #include "arrow/array/builder_binary.h"
 #include "arrow/array/builder_nested.h"
@@ -62,6 +64,7 @@
 #include "storage/loon_ffi/ffi_reader_c.h"
 #include "storage/loon_ffi/util.h"
 #include "milvus-storage/ffi_c.h"
+#include "milvus-storage/properties.h"
 #include "milvus-storage/format/parquet/file_reader.h"
 #include "milvus-storage/filesystem/fs.h"
 #include "milvus-storage/reader.h"
@@ -1423,15 +1426,31 @@ GetFieldDatasFromStorageV2(std::vector<std::vector<std::string>>& remote_files,
     AssertInfo(fs != nullptr,
                "[StorageV2] storage v2 arrow file system is not initialized");
 
+    LOG_INFO("[GetFieldDatasFromStorageV2] field_id={}, column_group_id={}, "
+             "col_offset={}, num_files={}",
+             field_id, column_group_id, col_offset, remote_chunk_files.size());
+
     // set up channel for arrow reader
     auto field_data_info = FieldDataInfo();
     auto parallel_degree =
         static_cast<uint64_t>(DEFAULT_FIELD_MAX_MEMORY_LIMIT / FILE_SLICE_SIZE);
     field_data_info.arrow_reader_channel->set_capacity(parallel_degree);
 
+    LOG_INFO("[GetFieldDatasFromStorageV2] parallel_degree={}, "
+             "DEFAULT_FIELD_MAX_MEMORY_LIMIT={}, FILE_SLICE_SIZE={}",
+             parallel_degree, DEFAULT_FIELD_MAX_MEMORY_LIMIT, FILE_SLICE_SIZE.load());
+
     auto& pool = ThreadPools::GetThreadPool(milvus::ThreadPoolPriority::MIDDLE);
 
-    for (auto& column_group_file : remote_chunk_files) {
+    auto t_all_files_start = std::chrono::steady_clock::now();
+    int64_t total_rows_read = 0;
+    int64_t total_open_us = 0;
+    int64_t total_load_us = 0;
+
+    for (size_t file_i = 0; file_i < remote_chunk_files.size(); ++file_i) {
+        auto& column_group_file = remote_chunk_files[file_i];
+        auto t_file_start = std::chrono::steady_clock::now();
+
         // get all row groups for each file
         std::vector<std::vector<int64_t>> row_group_lists;
         auto result = milvus_storage::FileRowGroupReader::Make(
@@ -1459,6 +1478,11 @@ GetFieldDatasFromStorageV2(std::vector<std::vector<std::string>>& remote_files,
                    "schema from file: " +
                        column_group_file + " with error: " + status.ToString());
 
+        auto t_open_done = std::chrono::steady_clock::now();
+        auto open_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            t_open_done - t_file_start).count();
+        total_open_us += open_us;
+
         // split row groups for parallel reading
         auto strategy = std::make_unique<segcore::ParallelDegreeSplitStrategy>(
             parallel_degree);
@@ -1473,6 +1497,7 @@ GetFieldDatasFromStorageV2(std::vector<std::vector<std::string>>& remote_files,
                                     milvus::proto::common::LoadPriority::HIGH);
         });
         // read field data from channel
+        int64_t file_rows = 0;
         std::shared_ptr<milvus::ArrowDataWrapper> r;
         while (field_data_info.arrow_reader_channel->pop(r)) {
             size_t num_rows = 0;
@@ -1490,10 +1515,40 @@ GetFieldDatasFromStorageV2(std::vector<std::vector<std::string>>& remote_files,
                 field_data->FillFieldData(chunked_array);
             }
             field_data_list.push_back(field_data);
+            file_rows += num_rows;
         }
         // access underlying feature to get exception if any
         load_future.get();
+
+        auto t_file_done = std::chrono::steady_clock::now();
+        auto load_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            t_file_done - t_open_done).count();
+        total_load_us += load_us;
+        total_rows_read += file_rows;
+
+        // Log every 20 files + first 3 + last file
+        if (file_i < 3 || file_i % 20 == 0 ||
+            file_i == remote_chunk_files.size() - 1) {
+            LOG_INFO("[GetFieldDatasFromStorageV2] file[{}/{}] rg={}, rows={}, "
+                     "open={} ms, load={} ms, path={}",
+                     file_i, remote_chunk_files.size(), row_group_num,
+                     file_rows, open_us / 1000, load_us / 1000,
+                     column_group_file);
+        }
     }
+
+    auto t_all_files_end = std::chrono::steady_clock::now();
+    auto all_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        t_all_files_end - t_all_files_start).count();
+    int64_t total_bytes = total_rows_read * dim * 4;
+    LOG_INFO("[GetFieldDatasFromStorageV2] DONE: files={}, total_rows={}, "
+             "total_bytes={} MB, total_open={} ms, total_load={} ms, "
+             "total={} ms, throughput={} MB/s",
+             remote_chunk_files.size(), total_rows_read,
+             total_bytes / (1024*1024),
+             total_open_us / 1000, total_load_us / 1000, all_ms,
+             all_ms > 0 ? (total_bytes / (1024.0*1024.0)) / (all_ms / 1000.0) : 0);
+
     return field_data_list;
 }
 
@@ -1505,6 +1560,15 @@ GetFieldDatasFromManifest(
     std::optional<DataType> data_type,
     int64_t dim,
     std::optional<DataType> element_type) {
+    // Initialize Loon thread pool for parallel S3 reads (once)
+    static std::once_flag loon_tp_flag;
+    std::call_once(loon_tp_flag, []() {
+        const size_t num_threads = 8;
+        auto result = loon_thread_pool_singleton(num_threads);
+        LOG_INFO("[GetFieldDatasFromManifest] Initialized Loon thread pool with {} threads, err_code={}",
+                 num_threads, result.err_code);
+    });
+
     auto loon_manifest = GetLoonManifest(manifest_path, loon_ffi_properties);
     auto column_groups = std::make_shared<milvus_storage::api::ColumnGroups>(
         loon_manifest->columnGroups());
@@ -1555,6 +1619,13 @@ GetFieldDatasFromManifest(
         arrow::Schema({arrow_schema->field(0)->WithName(
             std::to_string((field_meta.field_id)))}));
 
+    // Increase batch size for index build (128MB instead of default 32MB)
+    milvus_storage::api::SetValue(
+        *loon_ffi_properties,
+        PROPERTY_READER_RECORD_BATCH_MAX_SIZE,
+        std::to_string(128LL * 1024 * 1024).c_str());
+
+    auto t_reader_create_start = std::chrono::steady_clock::now();
     auto reader = milvus_storage::api::Reader::create(
         column_groups,
         updated_schema,
@@ -1570,12 +1641,25 @@ GetFieldDatasFromManifest(
                    reader_result.status().ToString());
 
     auto record_batch_reader = reader_result.ValueOrDie();
+    auto t_reader_create_end = std::chrono::steady_clock::now();
+    auto reader_create_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        t_reader_create_end - t_reader_create_start).count();
+    LOG_INFO("[GetFieldDatasFromManifest] Reader created in {} ms, column_groups={}, "
+             "manifest={}",
+             reader_create_ms, column_groups->size(), manifest_path);
 
     // Read all record batches and convert to FieldDataPtr
     std::vector<FieldDataPtr> field_datas;
+    int64_t read_next_us = 0, convert_us = 0;
+    int batch_count = 0;
+    int64_t total_rows_read = 0;
+    auto t_loop_start = std::chrono::steady_clock::now();
     while (true) {
+        auto t0 = std::chrono::steady_clock::now();
         std::shared_ptr<arrow::RecordBatch> batch;
         auto status = record_batch_reader->ReadNext(&batch);
+        auto t1 = std::chrono::steady_clock::now();
+        read_next_us += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
         AssertInfo(status.ok(),
                    "Failed to read record batch: " + status.ToString());
         if (batch == nullptr) {
@@ -1588,6 +1672,7 @@ GetFieldDatasFromManifest(
             continue;
         }
 
+        auto t2 = std::chrono::steady_clock::now();
         auto chunked_array = std::make_shared<arrow::ChunkedArray>(
             batch->GetColumnByName(field_id_str));
         auto field_data = CreateFieldData(data_type.value(),
@@ -1597,7 +1682,18 @@ GetFieldDatasFromManifest(
                                           num_rows);
         field_data->FillFieldData(chunked_array);
         field_datas.push_back(field_data);
+        auto t3 = std::chrono::steady_clock::now();
+        convert_us += std::chrono::duration_cast<std::chrono::microseconds>(t3 - t2).count();
+        batch_count++;
+        total_rows_read += num_rows;
     }
+    auto t_loop_end = std::chrono::steady_clock::now();
+    auto loop_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_loop_end - t_loop_start).count();
+    LOG_INFO("[GetFieldDatasFromManifest] total={} ms, ReadNext={} ms, convert={} ms, "
+             "batches={}, rows={}, avg_rows_per_batch={}",
+             loop_ms, read_next_us / 1000, convert_us / 1000,
+             batch_count, total_rows_read,
+             batch_count > 0 ? total_rows_read / batch_count : 0);
 
     return field_datas;
 }
